@@ -1,0 +1,19 @@
+[
+{"name":"host","value":"127.0.0.1"},
+{"name":"port","value":"4400"},
+{"name":"password","value":"testpass"},
+{"name":"servername","value":"sasl.midiandmore.net"},
+{"name":"description","value":"SASL auth relay"},
+{"name":"numeric","value":"SZ"},
+{"name":"identd","value":"sasl"},
+{"name":"id","value":"666"},
+{"name":"nick","value":"A"},
+{"name":"account","value":"A"},
+{"name":"controlNick","value":"N"},
+{"name":"controlNumeric","value":""},
+{"name":"dbhost","value":"127.0.0.1"},
+{"name":"db","value":"chanserv"},
+{"name":"dbuser","value":"postgres"},
+{"name":"dbpassword","value":"change-me"},
+{"name":"dbssl","value":"false"}
+]
