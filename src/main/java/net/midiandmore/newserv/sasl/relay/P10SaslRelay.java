@@ -18,16 +18,19 @@ final class P10SaslRelay {
     private static final String SASL_MECHANISMS = "PLAIN SCRAM-SHA-1 SCRAM-SHA-256 SCRAM-SHA-512";
     private final JsonConfig config;
     private final AuthDatabase database;
+    private final boolean debug;
     private final SecureRandom random = new SecureRandom();
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<String>> remoteAuth = new ConcurrentHashMap<>();
     private final Map<String, String> userNumerics = new ConcurrentHashMap<>();
     private PrintWriter writer;
+    private boolean endOfBurstSent;
     private volatile boolean burstComplete;
 
-    P10SaslRelay(JsonConfig config) {
+    P10SaslRelay(JsonConfig config, boolean debug) {
         this.config = config;
         this.database = new AuthDatabase(config);
+        this.debug = debug;
     }
 
     void run() throws InterruptedException {
@@ -38,6 +41,7 @@ final class P10SaslRelay {
                 System.err.println("P10 relay disconnected: " + ex.getMessage());
             } finally {
                 writer = null;
+                endOfBurstSent = false;
                     burstComplete = false;
                 sessions.clear();
                     userNumerics.clear();
@@ -49,6 +53,7 @@ final class P10SaslRelay {
     }
 
     private void connect() throws Exception {
+        debug("Connecting to " + config.get("host", "127.0.0.1") + ":" + config.intValue("port", 4400));
         try (Socket socket = new Socket(config.get("host", "127.0.0.1"), config.intValue("port", 4400));
              BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
             writer = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
@@ -59,15 +64,22 @@ final class P10SaslRelay {
                     numeric(), config.get("nick", "A"), now(), config.get("identd", "sasl"),
                     config.get("servername", "sasl"), config.get("account", "A"), now(), config.get("id", "666"),
                     numeric(), config.get("description", "SASL relay"));
-            send("%s EB", numeric());
+            if (!endOfBurstSent) {
+                send("%s EB", numeric());
+                endOfBurstSent = true;
+                debug("Local EB sent");
+            }
             String line;
             while ((line = reader.readLine()) != null) {
                 if (handlePingPong(line)) {
                     continue;
                 }
                 if (isEndOfBurst(line)) {
-                    burstComplete = true;
-                    send("%s EA", numeric());
+                    if (!burstComplete) {
+                        burstComplete = true;
+                        send("%s EA", numeric());
+                        debug("Server burst complete; EA sent");
+                    }
                     continue;
                 }
                 rememberUserNumeric(line);
@@ -131,7 +143,7 @@ final class P10SaslRelay {
         if (host == null || host.isBlank()) {
             host = targetNick;
         }
-        System.err.println("Received AUTHENTICATE target=" + targetNick + " host=" + host + " payloadLength=" + payload.length());
+        debug("Received AUTHENTICATE target=" + targetNick + " host=" + host + " payloadLength=" + payload.length());
         String finalTargetNick = targetNick;
         String finalHost = host;
         String finalPayload = payload;
@@ -232,26 +244,31 @@ final class P10SaslRelay {
     }
 
     private void processAuthenticate(String targetNick, String host, String payload) {
+        if (payload.isEmpty()) {
+            return;
+        }
         Session session = sessions.computeIfAbsent(targetNick, ignored -> new Session());
         session.host = host != null && !host.isBlank() ? host : targetNick;
-        try {
-            if (session.mechanism == null) {
-                start(session, targetNick, payload);
-                return;
+        synchronized (session) {
+            try {
+                if (session.mechanism == null) {
+                    start(session, targetNick, payload);
+                    return;
+                }
+                if (session.mechanism.equalsIgnoreCase(payload) && session.serverFirst == null) {
+                    debug("Ignoring duplicate mechanism request for " + targetNick + ": " + payload);
+                    return;
+                }
+                if ("PLAIN".equals(session.mechanism)) {
+                    finishPlain(session, targetNick, payload);
+                } else {
+                    finishScram(session, targetNick, payload);
+                }
+            } catch (Exception ex) {
+                sessions.remove(targetNick);
+                sendAuthenticate(targetNick, session.host, "*");
+                System.err.println("SASL exchange failed for " + targetNick + ": " + ex.getMessage());
             }
-            if (session.mechanism.equalsIgnoreCase(payload) && session.serverFirst == null) {
-                System.err.println("Ignoring duplicate mechanism request for " + targetNick + ": " + payload);
-                return;
-            }
-            if ("PLAIN".equals(session.mechanism)) {
-                finishPlain(session, targetNick, payload);
-            } else {
-                finishScram(session, targetNick, payload);
-            }
-        } catch (Exception ex) {
-            sessions.remove(targetNick);
-            sendAuthenticate(targetNick, session.host, "*");
-            System.err.println("SASL exchange failed for " + targetNick + ": " + ex.getMessage());
         }
     }
 
@@ -273,11 +290,10 @@ final class P10SaslRelay {
         String authzid = values[0].isBlank() ? targetNick : values[0];
         String username = values[1];
         String host = session.host;
-        System.err.println("Sending remoteauth for " + targetNick + " account " + username + " host=" + host);
+        debug("Sending remoteauth for " + targetNick + " account " + username + " host=" + host);
         RemoteAuthResult result = remoteAuth(targetNick, username, values[2], authzid, username, host);
         if (result != null) {
             sendAuthSuccess(targetNick, session.host, username, result);
-            sendAuthenticate(targetNick, session.host, "+");
         } else {
             sendAuthenticate(targetNick, session.host, "F");
         }
@@ -301,15 +317,15 @@ final class P10SaslRelay {
             session.nonce = nonce + Scram.base64(randomBytes(18));
             session.clientFirstBare = message.substring(3);
             session.serverFirst = "r=" + session.nonce + ",s=" + Scram.base64(salt) + ",i=" + SCRAM_ITERATIONS;
-            System.err.println("SCRAM client-first target=" + targetNick + " account=" + session.username
+            debug("SCRAM client-first target=" + targetNick + " account=" + session.username
                     + " hash=" + session.hash);
                 String serverFirstPayload = Scram.base64(session.serverFirst.getBytes(StandardCharsets.UTF_8));
-                System.err.println("Sending SCRAM server-first target=" + targetNick
+                debug("Sending SCRAM server-first target=" + targetNick
                     + " payloadLength=" + serverFirstPayload.length());
                 sendAuthenticate(targetNick, session.host, serverFirstPayload);
             return;
         }
-        System.err.println("SCRAM client-final target=" + targetNick + " account=" + session.username);
+        debug("SCRAM client-final target=" + targetNick + " account=" + session.username);
         Map<String, String> attributes = attributes(message);
         String proof = required(attributes, "p");
         if (!session.nonce.equals(required(attributes, "r")) || !"biws".equals(required(attributes, "c"))) {
@@ -326,14 +342,14 @@ final class P10SaslRelay {
             throw new IllegalArgumentException("Invalid SCRAM proof");
         }
         byte[] serverKey = Scram.hmac(session.hash, salted, "Server Key");
-        sendAuthenticate(targetNick, session.host, Scram.base64(("v=" + Scram.base64(Scram.hmac(session.hash, serverKey, authMessage))).getBytes(StandardCharsets.UTF_8)));
         RemoteAuthResult result = remoteAuth(targetNick, session.username, session.password,
             targetNick, session.username, session.host);
         if (result != null) {
-            System.err.println("SCRAM remoteauth succeeded for " + targetNick);
+            debug("SCRAM remoteauth succeeded for " + targetNick);
+            sendAuthenticate(targetNick, session.host, Scram.base64(("v=" + Scram.base64(Scram.hmac(session.hash, serverKey, authMessage))).getBytes(StandardCharsets.UTF_8)));
             sendAuthSuccess(targetNick, session.host, session.username, result);
         } else {
-            System.err.println("SCRAM remoteauth failed for " + targetNick);
+            debug("SCRAM remoteauth failed for " + targetNick);
             sendAuthenticate(targetNick, session.host, "F");
         }
         sessions.remove(targetNick);
@@ -355,7 +371,7 @@ final class P10SaslRelay {
                     + config.get("controlNick", "N"));
             throw new IllegalStateException("Control nick has no known P10 numeric");
         }
-        System.err.println("P10 remoteauth target=" + controlNumeric + " account=" + account + " nick=" + targetNick);
+        debug("P10 remoteauth target=" + controlNumeric + " account=" + account + " nick=" + targetNick);
         send("%sAAA P %s :remoteauth %s %s %d %s %s %s", numeric(), controlNumeric,
             account.toLowerCase(), hash, timestamp, authzid, username, host);
         try {
@@ -429,20 +445,26 @@ final class P10SaslRelay {
     }
 
     private void sendAuthenticate(String targetNick, String host, String payload) {
-        System.err.println("Sending AUTHENTICATE target=" + targetNick + " host=" + host + " payloadLength=" + payload.length());
+        debug("Sending AUTHENTICATE target=" + targetNick + " host=" + host + " payloadLength=" + payload.length());
         send("%s AUTHENTICATE %s %s %s", numeric(), targetNick, host, payload);
     }
 
     private void sendAuthenticateMechanisms(String targetNick, String host) {
-        System.err.println("Sending SASL mechanisms target=" + targetNick + " host=" + host);
+        debug("Sending SASL mechanisms target=" + targetNick + " host=" + host);
         send("%s AUTHENTICATE %s %s M :%s", numeric(), targetNick, host, SASL_MECHANISMS);
     }
 
     private void sendAuthSuccess(String targetNick, String host, String account, RemoteAuthResult result) {
-        System.err.println("Sending SASL success target=" + targetNick + " host=" + host + " account=" + account
+        debug("Sending SASL success target=" + targetNick + " host=" + host + " account=" + account
                 + " time=" + result.timestamp() + " id=" + result.id());
         send("%s AUTHENTICATE %s %s S %s %s %s", numeric(), targetNick, host, account,
             result.timestamp(), result.id());
+    }
+
+    private void debug(String message) {
+        if (debug) {
+            System.err.println("[DEBUG] " + message);
+        }
     }
 
     private void send(String format, Object... args) {
